@@ -1,627 +1,237 @@
+# app.py
 import streamlit as st
 import psycopg2
 import pandas as pd
 import hashlib
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import plotly.express as px
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
-st.set_page_config(
-    page_title="Client Query Management",
-    page_icon="🌐",
-    layout="wide",
-)
+# ================= CONFIG =================
+DB_CONFIG = {
+    "dbname": "query_system",
+    "user": "postgres",
+    "password": "lord818720",
+    "host": "localhost",
+    "port": "5432"
+}
 
-# =========================================================
-# GLOBAL STYLING (Fonts, Colors, Layout)
-# =========================================================
-st.markdown(
-    """
-    <style>
-    /* Import professional font */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+st.set_page_config("Client Query Management", "🌐", layout="wide")
 
-    :root {
-        --bg-grad-1: #050817;
-        --bg-grad-2: #081529;
-        --accent-1: #00D4FF;
-        --accent-2: #FF6EC7;
-        --accent-soft: rgba(0,212,255,0.13);
-        --muted: #9AA7BF;
-        --card-bg: rgba(255, 255, 255, 0.03);
-        --card-border: rgba(255, 255, 255, 0.08);
-        --danger: #ff4b6a;
-        --success: #3ddc84;
-    }
+# ================= STYLE =================
+st.markdown("""
+<style>
+* { font-family: 'Inter', sans-serif; }
+.stApp { background: radial-gradient(circle at top left,#0b1221,#02030a); }
+.main .block-container {
+  padding:2rem; border-radius:14px;
+  background:linear-gradient(145deg,rgba(8,10,20,.85),rgba(3,6,20,.95));
+}
+</style>
+""", unsafe_allow_html=True)
 
-    * {
-        font-family: 'Inter', sans-serif;
-    }
+# ================= UTILS =================
+def safe_rerun():
+    try:
+        st.experimental_rerun()
+    except Exception:
+        st.session_state["_reload"] = not st.session_state.get("_reload", False)
+        st.stop()
 
-    .stApp {
-        background: radial-gradient(circle at top left, #182848 0, #050817 45%);
-    }
+def db():
+    return psycopg2.connect(**DB_CONFIG)
 
-    /* Main content container */
-    .main .block-container {
-        padding: 2.2rem 2.4rem 3rem 2.4rem;
-        border-radius: 18px;
-        background: linear-gradient(
-            145deg,
-            rgba(9, 11, 25, 0.96),
-            rgba(5, 10, 35, 0.99)
-        );
-        box-shadow: 0 18px 45px rgba(0,0,0,0.8);
-        border: 1px solid rgba(255, 255, 255, 0.03);
-    }
+def hash_pw(p): 
+    return hashlib.sha256(p.encode()).hexdigest()
 
-    /* Header */
-    .cq-header {
-        display: flex;
-        align-items: center;
-        gap: 18px;
-        margin-bottom: 0.25rem;
-    }
+# ================= SCHEMA =================
+def ensure_schema():
+    conn=db(); cur=conn.cursor()
+    cur.execute("""
+        ALTER TABLE queries
+        ADD COLUMN IF NOT EXISTS support_notes TEXT,
+        ADD COLUMN IF NOT EXISTS closed_by VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS requirement TEXT;
+    """)
+    conn.commit(); conn.close()
 
-    .cq-logo {
-        width: 64px;
-        height: 64px;
-        border-radius: 18px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: conic-gradient(from 200deg, var(--accent-1), var(--accent-2), #7f5af0, var(--accent-1));
-        color: #020617;
-        font-weight: 800;
-        font-size: 26px;
-        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.85);
-    }
+# ================= AUTH =================
+def login_user(u,p,r):
+    conn=db(); cur=conn.cursor()
+    cur.execute("SELECT hashed_password FROM users WHERE username=%s AND role=%s",(u,r))
+    row=cur.fetchone(); conn.close()
+    return row and hash_pw(p)==row[0]
 
-    .cq-title-main {
-        font-size: 1.9rem;
-        font-weight: 700;
-        letter-spacing: 0.03em;
-        color: #E5F4FF;
-        margin: 0;
-    }
+def add_user(u,p,r):
+    conn=db(); cur=conn.cursor()
+    cur.execute("""
+      INSERT INTO users VALUES(%s,%s,%s)
+      ON CONFLICT(username) DO NOTHING
+    """,(u,hash_pw(p),r))
+    conn.commit(); conn.close()
 
-    .cq-subtitle {
-        font-size: 0.95rem;
-        color: var(--muted);
-        margin-top: 0.2rem;
-    }
+# ================= QUERIES =================
+def create_query(e,m,h,d,req):
+    conn=db(); cur=conn.cursor()
+    cur.execute("""
+      INSERT INTO queries
+      (mail_id,mobile_number,query_heading,query_description,requirement,status,query_created_time)
+      VALUES(%s,%s,%s,%s,%s,'Open',%s)
+    """,(e,m,h,d,req,datetime.now()))
+    conn.commit(); conn.close()
 
-    /* Section titles */
-    h2, h3 {
-        color: #E5F4FF !important;
-        letter-spacing: 0.02em;
-    }
+def close_query(qid,user,note):
+    conn=db(); cur=conn.cursor()
+    cur.execute("""
+      UPDATE queries SET
+      status='Closed',
+      query_closed_time=%s,
+      support_notes=%s,
+      closed_by=%s
+      WHERE query_id=%s
+    """,(datetime.now(),note,user,qid))
+    conn.commit(); conn.close()
 
-    /* Horizontal rule */
-    hr {
-        border: 0;
-        border-top: 1px solid rgba(148, 163, 184, 0.35);
-        margin: 0.75rem 0 1.4rem 0;
-    }
+@st.cache_data(ttl=30)
+def all_queries():
+    conn=db()
+    df=pd.read_sql("SELECT * FROM queries",conn)
+    conn.close()
+    if df.empty: 
+        return df
+    df=df.drop_duplicates("query_id")
+    df["status"]=df["status"].str.title()
+    df["query_created_time"]=pd.to_datetime(df["query_created_time"])
+    df["query_closed_time"]=pd.to_datetime(df["query_closed_time"],errors="coerce")
+    return df
 
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #020617, #03091a);
-        border-right: 1px solid rgba(148,163,184,0.3);
-    }
+# ================= SESSION =================
+if "logged" not in st.session_state:
+    st.session_state.logged=False
+    st.session_state.user=None
+    st.session_state.role=None
 
-    /* Inputs */
-    .stTextInput > div > div > input,
-    .stNumberInput > div > div > input,
-    .stTextArea > div > div > textarea,
-    .stSelectbox > div > div,
-    .stRadio > div {
-        background: radial-gradient(circle at top left, rgba(15,23,42,0.9), rgba(15,23,42,0.9));
-        border-radius: 12px !important;
-        border: 1px solid rgba(148,163,184,0.55) !important;
-        color: #E5F4FF !important;
-        box-shadow: inset 0 0 0 1px rgba(15,23,42,0.75);
-    }
+# ================= HEADER =================
+st.markdown("""
+<h2 style="color:#E5F4FF">Client Query Management System</h2>
+<p style="color:#9AA7BF">Secure role-based ticket platform</p><hr>
+""", unsafe_allow_html=True)
 
-    .stTextInput > div > div > input:focus,
-    .stNumberInput > div > div > input:focus,
-    .stTextArea > div > div > textarea:focus {
-        border-color: var(--accent-1) !important;
-        box-shadow: 0 0 0 1px var(--accent-1);
-    }
+# ================= SIDEBAR (AUTH ONLY) =================
+with st.sidebar:
+    st.subheader("🔐 Account")
 
-    /* Buttons */
-    .stButton > button {
-        background: linear-gradient(90deg, var(--accent-1), var(--accent-2));
-        color: #020617;
-        font-weight: 600;
-        border-radius: 999px;
-        border: none;
-        padding: 0.45rem 1.4rem;
-        box-shadow: 0 12px 20px rgba(15,23,42,0.8);
-        letter-spacing: 0.02em;
-    }
+    if not st.session_state.logged:
+        mode=st.radio("",["Login","Register"])
+        u=st.text_input("Email")
+        p=st.text_input("Password",type="password")
+        r=st.radio("Role",["Client","Support","Admin"])
+        if st.button(mode):
+            if mode=="Login":
+                if login_user(u,p,r):
+                    st.session_state.logged=True
+                    st.session_state.user=u
+                    st.session_state.role=r
+                    safe_rerun()
+                else:
+                    st.error("Invalid credentials")
+            else:
+                add_user(u,p,r)
+                st.success("Account created")
+    else:
+        st.success(f"{st.session_state.role} : {st.session_state.user}")
+        if st.button("Logout"):
+            st.session_state.logged=False
+            safe_rerun()
 
-    .stButton > button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 14px 26px rgba(15,23,42,1);
-    }
+# ================= PUBLIC BLOCK =================
+if not st.session_state.logged:
+    st.markdown("""
+    ### 👋 Welcome
 
-    /* KPI Cards */
-    .kpi-card {
-        background: radial-gradient(circle at top left, rgba(15, 23, 42, 0.95), rgba(2,6,23,0.98));
-        border-radius: 16px;
-        padding: 0.8rem 1rem;
-        border: 1px solid rgba(148,163,184,0.5);
-        box-shadow: 0 8px 22px rgba(0,0,0,0.8);
-    }
+    This is a **secure query management system**.
 
-    .kpi-label {
-        color: var(--muted);
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }
+    🔐 Please log in to:
+    - Create and track queries
+    - Access support dashboards
+    - View analytics (authorized roles only)
 
-    .kpi-value {
-        color: #E5F4FF;
-        font-size: 1.3rem;
-        font-weight: 600;
-        margin-top: 0.1rem;
-    }
+    **No data is visible publicly.**
+    """)
+    st.stop()
 
-    /* Dataframes */
-    .stDataFrame {
-        border-radius: 14px;
-        overflow: hidden;
-        border: 1px solid rgba(148,163,184,0.35);
-    }
+# ================= AFTER LOGIN =================
+ensure_schema()
+df=all_queries()
+role=st.session_state.role
 
-    /* Info pills */
-    .pill {
-        display: inline-flex;
-        align-items: center;
-        padding: 0.25rem 0.7rem;
-        border-radius: 999px;
-        background: rgba(15, 23, 42, 0.9);
-        border: 1px solid rgba(148,163,184,0.5);
-        font-size: 0.78rem;
-        color: var(--muted);
-        gap: 0.35rem;
-    }
+# ================= NAVIGATION (ROLE BASED) =================
+with st.sidebar:
+    st.markdown("---")
+    if role=="Client":
+        page=st.radio("Menu",["Create Ticket","My Tickets"])
+    elif role=="Support":
+        page=st.radio("Menu",["Dashboard","Support"])
+    else:  # Admin
+        page=st.radio("Menu",["Dashboard","Admin"])
 
-    .pill-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 999px;
-        background: var(--accent-1);
-    }
+# ================= KPIs (ONLY SUPPORT & ADMIN) =================
+if role in ("Support","Admin"):
+    c1,c2,c3=st.columns(3)
+    c1.metric("Total",df["query_id"].nunique())
+    c2.metric("Open",df[df.status=="Open"]["query_id"].nunique())
+    c3.metric("Closed",df[df.status=="Closed"]["query_id"].nunique())
 
-    .pill-dot.green { background: var(--success); }
-    .pill-dot.red { background: var(--danger); }
+# ================= DASHBOARD =================
+if page=="Dashboard" and role in ("Support","Admin"):
+    df["month"]=df["query_created_time"].dt.to_period("M").astype(str)
+    monthly=df.groupby("month")["query_id"].nunique().reset_index(name="count")
+    st.plotly_chart(px.bar(monthly,x="month",y="count",title="Monthly Queries"),use_container_width=True)
 
-    /* Tip card */
-    .tip-card {
-        background: var(--card-bg);
-        border-radius: 16px;
-        padding: 1rem;
-        border: 1px solid var(--card-border);
-    }
-
-    .tip-title {
-        font-size: 0.95rem;
-        font-weight: 600;
-        color: #E5F4FF;
-        margin-bottom: 0.35rem;
-    }
-
-    .tip-body {
-        font-size: 0.82rem;
-        color: var(--muted);
-        line-height: 1.4;
-    }
-
-    @media (max-width: 768px) {
-        .cq-header {
-            flex-direction: row;
-            align-items: center;
-        }
-        .cq-title-main {
-            font-size: 1.55rem;
-        }
-        .main .block-container {
-            padding: 1.3rem 1.1rem 2rem 1.1rem;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================================================
-# DATABASE CONNECTION
-# =========================================================
-def init_connection():
-    return psycopg2.connect(
-        dbname=st.secrets["DB_NAME"],
-        user=st.secrets["DB_USER"],
-        password=st.secrets["DB_PASSWORD"],
-        host=st.secrets["DB_HOST"],
-        port=st.secrets["DB_PORT"],
+    clustered=df.groupby(["month","status"])["query_id"].nunique().reset_index(name="count")
+    st.plotly_chart(
+        px.bar(clustered,x="month",y="count",color="status",
+               barmode="group",title="Monthly Queries by Status"),
+        use_container_width=True
     )
 
-# =========================================================
-# AUTH / HASHING
-# =========================================================
-def make_hashes(password: str) -> str:
-    return hashlib.sha256(str(password).encode()).hexdigest()
+# ================= CLIENT =================
+if role=="Client" and page=="Create Ticket":
+    with st.form("new"):
+        h=st.text_input("Heading")
+        d=st.text_area("Description")
+        r=st.text_input("Requirement")
+        m=st.text_input("Mobile")
+        if st.form_submit_button("Submit"):
+            create_query(st.session_state.user,m,h,d,r)
+            st.success("Ticket submitted")
+            safe_rerun()
 
+if role=="Client" and page=="My Tickets":
+    my=df[df.mail_id==st.session_state.user]
+    for _,q in my.iterrows():
+        with st.expander(f"#{q.query_id} {q.query_heading} [{q.status}]"):
+            st.write(q.query_description)
+            st.write("Requirement:",q.requirement)
+            if q.support_notes:
+                st.info(q.support_notes)
 
-def check_hashes(password: str, hashed_text: str) -> bool:
-    return make_hashes(password) == hashed_text
+# ================= SUPPORT =================
+if role=="Support" and page=="Support":
+    since=st.date_input("Since",date.today()-timedelta(days=30))
+    sdf=df[(df.query_created_time>=pd.to_datetime(since))&(df.status=="Open")]
+    st.dataframe(sdf[["query_id","mail_id","query_heading","requirement"]])
 
+    if not sdf.empty:
+        qid=st.selectbox("Close Ticket",sdf.query_id)
+        note=st.text_area("Support note")
+        if st.button("Close"):
+            close_query(qid,st.session_state.user,note)
+            st.success("Closed")
+            safe_rerun()
 
-def login_user(username: str, password: str, role: str) -> bool:
-    try:
-        conn = init_connection()
-        with conn:
-            with conn.cursor() as c:
-                c.execute(
-                    "SELECT username, hashed_password, role FROM users WHERE username=%s AND role=%s",
-                    (username, role),
-                )
-                data = c.fetchone()
-        if data and check_hashes(password, data[1]):
-            return True
-    except Exception as e:
-        st.error(f"Database Error (login): {e}")
-    return False
-
-
-def add_user(username: str, password: str, role: str) -> bool:
-    try:
-        conn = init_connection()
-        hashed_pswd = make_hashes(password)
-        with conn:
-            with conn.cursor() as c:
-                c.execute(
-                    "INSERT INTO users (username, hashed_password, role) VALUES (%s, %s, %s)",
-                    (username, hashed_pswd, role),
-                )
-        return True
-    except Exception as e:
-        st.error(f"Error creating user: {e}")
-        return False
-
-# =========================================================
-# QUERY HELPERS
-# =========================================================
-def create_query(email: str, mobile: str, heading: str, desc: str):
-    try:
-        conn = init_connection()
-        now = datetime.now()
-        with conn:
-            with conn.cursor() as c:
-                c.execute(
-                    """
-                    INSERT INTO queries (mail_id, mobile_number, query_heading, query_description, status, query_created_time)
-                    VALUES (%s, %s, %s, %s, 'Open', %s)
-                    RETURNING query_id
-                    """,
-                    (email, mobile, heading, desc, now),
-                )
-                query_id = c.fetchone()[0]
-        return query_id
-    except Exception as e:
-        st.error(f"Error creating query: {e}")
-        return None
-
-
-def close_query(query_id: int) -> bool:
-    try:
-        conn = init_connection()
-        now = datetime.now()
-        with conn:
-            with conn.cursor() as c:
-                c.execute(
-                    "UPDATE queries SET status='Closed', query_closed_time=%s WHERE query_id=%s",
-                    (now, query_id),
-                )
-        return True
-    except Exception as e:
-        st.error(f"Error closing query: {e}")
-        return False
-
-# =========================================================
-# SESSION STATE
-# =========================================================
-if "logged_in" not in st.session_state:
-    st.session_state["logged_in"] = False
-if "role" not in st.session_state:
-    st.session_state["role"] = None
-if "username" not in st.session_state:
-    st.session_state["username"] = None
-
-# =========================================================
-# MAIN APP
-# =========================================================
-def main():
-    # ---------- Header ----------
-    col_logo, col_text = st.columns([0.16, 1.8])
-    with col_logo:
-        st.markdown('<div class="cq-logo">CQ</div>', unsafe_allow_html=True)
-    with col_text:
-        st.markdown(
-            """
-            <div class="cq-header">
-                <div>
-                    <div class="cq-title-main">Client Query Management</div>
-                    <div class="cq-subtitle">
-                        Centralized hub to raise, track, and resolve client issues with clarity and speed.
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    st.markdown("<hr>", unsafe_allow_html=True)
-
-    # ---------- SIDEBAR AUTH ----------
-    if st.session_state["logged_in"]:
-        st.sidebar.markdown(f"### 👤 {st.session_state['username']}")
-        st.sidebar.caption(f"Role: {st.session_state['role']}")
-        st.sidebar.markdown(
-            '<div class="pill"><span class="pill-dot green"></span>Session active</div>',
-            unsafe_allow_html=True,
-        )
-        if st.sidebar.button("Logout"):
-            st.session_state["logged_in"] = False
-            st.session_state["role"] = None
-            st.session_state["username"] = None
-            st.rerun()
-    else:
-        st.sidebar.markdown("## 🔐 Account")
-        auth_choice = st.sidebar.radio(" ", ["Login", "Register"], label_visibility="collapsed")
-
-        if auth_choice == "Register":
-            st.sidebar.subheader("Create a new account")
-            new_user = st.sidebar.text_input("Username")
-            new_password = st.sidebar.text_input("Password", type="password")
-            role_choice = st.sidebar.radio(
-                "Register as",
-                ["Client", "Support", "Admin"],
-                horizontal=False,
-            )
-            if st.sidebar.button("Sign Up"):
-                if not new_user or not new_password:
-                    st.sidebar.warning("Please fill all fields.")
-                else:
-                    ok = add_user(new_user, new_password, role_choice)
-                    if ok:
-                        st.sidebar.success("Account created. Please login.")
-        else:
-            st.sidebar.subheader("Login")
-            username = st.sidebar.text_input("Username")
-            password = st.sidebar.text_input("Password", type="password")
-            role_choice = st.sidebar.radio(
-                "Login as",
-                ["Client", "Support", "Admin"],
-                horizontal=False,
-            )
-            if st.sidebar.button("Login"):
-                if login_user(username, password, role_choice):
-                    st.session_state["logged_in"] = True
-                    st.session_state["role"] = role_choice
-                    st.session_state["username"] = username
-                    st.sidebar.success("Login successful.")
-                    st.rerun()
-                else:
-                    st.sidebar.error("Invalid username, password, or role.")
-
-    # ---------- CONTENT BASED ON LOGIN ----------
-    if not st.session_state["logged_in"]:
-        # Logged-out landing content
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.markdown("### Welcome to your support cockpit")
-            st.write(
-                """
-                - 🎯 **Clients** can raise tickets and track their status in one place.  
-                - 🛠️ **Support & Admin** get a live dashboard to manage, close, and analyze queries.  
-
-                Use the panel on the left to **register** or **login** and start managing queries.
-                """
-            )
-        with col_right:
-            st.markdown(
-                """
-                <div class="tip-card">
-                    <div class="tip-title">Getting started</div>
-                    <div class="tip-body">
-                        • Create a <b>Client</b> account if you only raise tickets. <br/>
-                        • Create a <b>Support</b> or <b>Admin</b> account to manage and close tickets. <br/>
-                        • All changes are reflected instantly in the shared dashboard.
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        return
-
-    # ---------- LOGGED IN: DASHBOARDS ----------
-    # open one connection for duration of dashboard usage
-    try:
-        conn = init_connection()
-    except Exception as e:
-        st.error(f"Unable to connect to database: {e}")
-        return
-
-    # ========== CLIENT DASHBOARD ==========
-    if st.session_state["role"] == "Client":
-        st.markdown("## 📨 Raise a New Query")
-
-        form_col, tip_col = st.columns([2.1, 1])
-        with form_col:
-            with st.form("query_form"):
-                email = st.text_input("Email ID")
-                mobile = st.text_input("Mobile Number")
-                heading = st.text_input("Query Heading")
-                desc = st.text_area("Describe your issue in detail", height=160)
-
-                submit = st.form_submit_button("Submit Ticket")
-
-                if submit:
-                    if not (email and mobile and heading and desc):
-                        st.warning("Please fill all fields before submitting.")
-                    else:
-                        qid = create_query(email, mobile, heading, desc)
-                        if qid:
-                            st.success(f"Your ticket has been created. Ticket ID: #{qid}")
-                            st.balloons()
-
-        with tip_col:
-            st.markdown(
-                """
-                <div class="tip-card">
-                    <div class="tip-title">Tips for faster resolution</div>
-                    <div class="tip-body">
-                        • Use a clear, short heading (e.g., <i>Login issue - OTP not received</i>). <br/>
-                        • Mention your browser / device if it's a UI problem. <br/>
-                        • Add any error messages exactly as you see them.
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("<hr>", unsafe_allow_html=True)
-
-        st.markdown("### 🕒 Recent Tickets")
-        try:
-            df = pd.read_sql(
-                "SELECT * FROM queries ORDER BY query_id DESC LIMIT 10",
-                conn,
-            )
-            if df.empty:
-                st.info("No tickets found yet. Create your first ticket above.")
-            else:
-                st.dataframe(df, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error loading recent tickets: {e}")
-
-    # ========== SUPPORT / ADMIN DASHBOARD ==========
-    else:
-        st.markdown("## 📊 Support Dashboard")
-
-        try:
-            df = pd.read_sql("SELECT * FROM queries", conn)
-        except Exception as e:
-            st.error(f"Error loading queries: {e}")
-            conn.close()
-            return
-
-        # Handle no data
-        if df.empty:
-            st.info("No queries found in the system yet.")
-            conn.close()
-            return
-
-        # KPI row
-        total_queries = len(df)
-        open_queries = len(df[df["status"] == "Open"])
-        closed_queries = len(df[df["status"] == "Closed"])
-
-        k1, k2, k3 = st.columns(3)
-        with k1:
-            st.markdown(
-                f"""
-                <div class="kpi-card">
-                    <div class="kpi-label">Total Queries</div>
-                    <div class="kpi-value">{total_queries}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with k2:
-            st.markdown(
-                f"""
-                <div class="kpi-card">
-                    <div class="kpi-label">Open / Pending</div>
-                    <div class="kpi-value">{open_queries}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with k3:
-            st.markdown(
-                f"""
-                <div class="kpi-card">
-                    <div class="kpi-label">Closed / Resolved</div>
-                    <div class="kpi-value">{closed_queries}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("<hr>", unsafe_allow_html=True)
-
-        tab_manage, tab_analytics = st.tabs(["🗂️ Manage Queries", "📈 Analytics"])
-
-        # ----- Manage Tab -----
-        with tab_manage:
-            st.subheader("Ticket List & Actions")
-            filter_col, _ = st.columns([1, 3])
-            with filter_col:
-                status_filter = st.selectbox("Filter by status", ["All", "Open", "Closed"])
-            if status_filter == "All":
-                view_df = df
-            else:
-                view_df = df[df["status"] == status_filter]
-
-            st.dataframe(view_df, use_container_width=True)
-
-            st.markdown("#### 🛠️ Close a Ticket")
-            action_col1, action_col2 = st.columns([2, 1])
-            with action_col1:
-                q_id = st.number_input("Enter Query ID", min_value=1, step=1)
-            with action_col2:
-                if st.button("Mark as Closed"):
-                    if close_query(int(q_id)):
-                        st.success(f"Ticket #{int(q_id)} marked as closed.")
-                        st.rerun()
-
-        # ----- Analytics Tab -----
-        with tab_analytics:
-            st.subheader("Insights & Trends")
-
-            # Pie chart: status distribution
-            status_counts = df["status"].value_counts().reset_index()
-            status_counts.columns = ["status", "count"]
-            fig_pie = px.pie(
-                status_counts,
-                values="count",
-                names="status",
-                title="Query Status Distribution",
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-            # Bar chart: top query headings
-            if "query_heading" in df.columns:
-                top_headings = df["query_heading"].value_counts().head(7).reset_index()
-                top_headings.columns = ["heading", "count"]
-                fig_bar = px.bar(
-                    top_headings,
-                    x="heading",
-                    y="count",
-                    title="Most Frequent Issue Types",
-                    labels={"heading": "Issue Type", "count": "Count"},
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-
-    conn.close()
-
-
-if __name__ == "__main__":
-    main()
+# ================= ADMIN =================
+if role=="Admin" and page=="Admin":
+    since=st.date_input("Since",date.today()-timedelta(days=90))
+    adf=df[df.query_created_time>=pd.to_datetime(since)]
+    st.dataframe(adf)
+    st.download_button("Export CSV",adf.to_csv(index=False),"queries.csv")
