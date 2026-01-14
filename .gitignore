@@ -1,3 +1,4 @@
 .env
 .venv
 synthetic_client_queries.csv
+preprocessed_data.csv

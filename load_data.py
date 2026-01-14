@@ -5,9 +5,9 @@ import hashlib
 from psycopg2.extras import execute_values
 
 db_config = {
-    "dbname": "query_system",
+    "dbname": "CQMS",
     "user": "postgres",
-    "password": "lord818720",
+    "password": "12345678",
     "host": "localhost",
     "port": "5432"
 }
@@ -15,7 +15,7 @@ db_config = {
 def make_hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
-def load_csv_to_postgres(csv_path="synthetic_client_queries.csv", demo_reset=True):
+def load_csv_to_postgres(csv_path="preprocessed_client_queries.csv", demo_reset=True):
     df = pd.read_csv(csv_path)
 
     # --- CLEAN DATA ---
